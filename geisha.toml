@@ -1,0 +1,9 @@
+name = "duckdb"
+version = "0.1.0"
+src_dir = "src"
+tests = ["tests/spec.gsa"]
+
+[target.native]
+c_sources = ["native/gs_duckdb.c"]
+c_flags = ["-I/opt/homebrew/opt/duckdb/include"]
+link_flags = ["-L/opt/homebrew/opt/duckdb/lib", "-Wl,-rpath,/opt/homebrew/opt/duckdb/lib", "-lduckdb"]

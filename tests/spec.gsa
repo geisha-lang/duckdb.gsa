@@ -1,0 +1,116 @@
+// Verification suite for `geisha-duckdb` (`tests/spec.gsa`).
+
+use std.result.{Result, Ok, Err}
+use std.str.{intToStr, i64ToStr, floatToStr}
+use sys.fs.removeFile
+use sys.io.eprintLn
+use sys.proc.exit
+
+use duckdb.duckdb.{
+    ColBool, ColInt64, ColFloat, ColString,
+    openMemory, closeDb, connect, disconnect,
+    exec, query, prepare, bindInt64, bindFloat, bindStr, execPrepared, closeStmt, closeResult,
+    resRowCount, resColCount, resColName, resColKind, resIsNull,
+    resGetInt64, resGetFloat, resGetStr,
+    resColToFloatArray, resColToInt64Array, resColToStrArray,
+    queryScalarInt64, queryScalarFloat,
+    readParquet, writeParquet
+}
+use duckdb.dsl.{
+    (|>),
+    col, litFloat, litStr, gt, eq, and_, isNotNull,
+    avg, countAll, asCol,
+    fromTable, fromParquet, select, filter, groupBy, orderByAsc, orderByDesc, limit,
+    toSql, runQuery, writeQueryParquet
+}
+
+def assertTrue(label: String, ok: Bool): Result Void String =
+    if (ok) Ok(()) else Err("ASSERT FAILED: " + label)
+
+def approxEq(a: Float, b: Float, eps: Float): Bool = {
+    let d = a - b;
+    (if (d < 0.0) 0.0 - d else d) <= eps
+}
+
+def testSqlAndPrepared(): Result Void String = {
+    let db = openMemory()?;
+    let conn = connect(db)?;
+
+    exec(conn, "CREATE TABLE prices (ts BIGINT, sym VARCHAR, close DOUBLE)")?;
+    let stmt = prepare(conn, "INSERT INTO prices VALUES (?, ?, ?)")?;
+
+    bindInt64(stmt, 1, intToI64(1700000000))?;
+    bindStr(stmt, 2, "BTCUSDT")?;
+    bindFloat(stmt, 3, 95000.5)?;
+    let r1 = execPrepared(stmt)?;
+    closeResult(r1);
+
+    bindInt64(stmt, 1, intToI64(1700003600))?;
+    bindStr(stmt, 2, "ETHUSDT")?;
+    bindFloat(stmt, 3, 3200.25)?;
+    let r2 = execPrepared(stmt)?;
+    closeResult(r2);
+    closeStmt(stmt);
+
+    exec(conn, "INSERT INTO prices VALUES (1700007200, 'SOLUSDT', NULL)")?;
+
+    let cnt = queryScalarInt64(conn, "SELECT COUNT(*) FROM prices")?;
+    assertTrue("row count == 3", cnt == intToI64(3))?;
+
+    let avgVal = queryScalarFloat(conn, "SELECT AVG(close) FROM prices")?;
+    assertTrue("AVG(close) approx 49100.375", approxEq(avgVal, 49100.375, 1.0e-6))?;
+
+    let res = query(conn, "SELECT ts, sym, close FROM prices ORDER BY ts")?;
+    assertTrue("resColCount == 3", resColCount(res) == 3)?;
+    assertTrue("resRowCount == 3", resRowCount(res) == intToI64(3))?;
+    assertTrue("col 1 name == sym", resColName(res, 1) == "sym")?;
+    assertTrue("row 2 close is NULL", resIsNull(res, 2, intToI64(2)))?;
+    assertTrue("row 0 sym == BTCUSDT", resGetStr(res, 1, intToI64(0)) == "BTCUSDT")?;
+
+    let closes = resColToFloatArray(res, 2);
+    assertTrue("bulk float col[0]", approxEq(arrayGet(closes, 0), 95000.5, 1.0e-9))?;
+    assertTrue("bulk float col[1]", approxEq(arrayGet(closes, 1), 3200.25, 1.0e-9))?;
+    // NULL -> NaN (in Geisha `==` is ordered `fcmp oeq`, so `!(v == v)` tests NaN)
+    let nanVal = arrayGet(closes, 2);
+    assertTrue("bulk float col[2] is NaN", !(nanVal == nanVal))?;
+
+    let tsArr = resColToInt64Array(res, 0);
+    assertTrue("bulk i64 col[2]", arrayGet(tsArr, 2) == intToI64(1700007200))?;
+    let syms = resColToStrArray(res, 1);
+    assertTrue("bulk str col[2]", arrayGet(syms, 2) == "SOLUSDT")?;
+    closeResult(res);
+
+    // Parquet round-trip + Query DSL (zero raw SQL!)
+    let pqPath = "/tmp/geisha_duckdb_test_prices.parquet";
+    let exportQ = fromTable("prices")
+        |> select([col("ts"), col("sym"), col("close")])
+        |> orderByAsc("ts");
+    writeQueryParquet(conn, exportQ, pqPath)?;
+
+    let dslQ = fromParquet(pqPath)
+        |> filter(and_(isNotNull(col("close")), gt(col("close"), litFloat(1000.0))))
+        |> select([col("sym"), asCol(avg(col("close")), "avg_close"), asCol(countAll(), "n")])
+        |> groupBy(["sym"])
+        |> orderByDesc("avg_close")
+        |> limit(2);
+    let dslRes = runQuery(conn, dslQ)?;
+    assertTrue("DSL query rows == 2", resRowCount(dslRes) == intToI64(2))?;
+    assertTrue("DSL top sym == BTCUSDT", resGetStr(dslRes, 0, intToI64(0)) == "BTCUSDT")?;
+    assertTrue("DSL top avg_close == 95000.5", approxEq(resGetFloat(dslRes, 1, intToI64(0)), 95000.5, 1.0e-6))?;
+    assertTrue("DSL second sym == ETHUSDT", resGetStr(dslRes, 0, intToI64(1)) == "ETHUSDT")?;
+    closeResult(dslRes);
+    let _ = removeFile(pqPath);
+
+    disconnect(conn);
+    closeDb(db);
+    printLn("  [PASS] duckdb + duckdb.dsl: SQL, prepared stmts, NULL->NaN bulk arrays, Parquet & Query DSL");
+    Ok(())
+}
+
+def main(): Void = {
+    printLn("Running geisha-duckdb test suite...");
+    match testSqlAndPrepared() {
+        Err(e) -> { eprintLn("FAIL: " + e); exit(1) },
+        Ok(_) -> printLn("geisha-duckdb: all tests passed!"),
+    }
+}

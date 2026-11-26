@@ -1,0 +1,309 @@
+// Native DuckDB 2.x bindings for Geisha (`duckdb`).
+// Supports in-memory & file databases, SQL queries, prepared statements,
+// Parquet/CSV/JSON queries, and bulk vectorized numeric column extraction.
+
+use std.result.{Result, Ok, Err}
+use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
+
+extern "gs_duck_open" def c_duck_open(path: String): Int64
+extern "gs_duck_close" def c_duck_close(db: Int64): Int
+extern "gs_duck_connect" def c_duck_connect(db: Int64): Int64
+extern "gs_duck_disconnect" def c_duck_disconnect(conn: Int64): Int
+extern "gs_duck_query" def c_duck_query(conn: Int64, sql: String): Int64
+extern "gs_duck_prepare" def c_duck_prepare(conn: Int64, sql: String): Int64
+extern "gs_duck_bind_i64" def c_duck_bind_i64(stmt: Int64, idx: Int, val: Int64): Int
+extern "gs_duck_bind_f64" def c_duck_bind_f64(stmt: Int64, idx: Int, val: Float): Int
+extern "gs_duck_bind_str" def c_duck_bind_str(stmt: Int64, idx: Int, val: String): Int
+extern "gs_duck_bind_bool" def c_duck_bind_bool(stmt: Int64, idx: Int, val: Int): Int
+extern "gs_duck_bind_null" def c_duck_bind_null(stmt: Int64, idx: Int): Int
+extern "gs_duck_exec_prepared" def c_duck_exec_prepared(stmt: Int64): Int64
+extern "gs_duck_destroy_prepare" def c_duck_destroy_prepare(stmt: Int64): Int
+extern "gs_duck_res_close" def c_duck_res_close(res: Int64): Int
+extern "gs_duck_res_row_count" def c_duck_res_row_count(res: Int64): Int64
+extern "gs_duck_res_col_count" def c_duck_res_col_count(res: Int64): Int
+extern "gs_duck_res_col_name" def c_duck_res_col_name(res: Int64, col: Int): String
+extern "gs_duck_res_col_kind" def c_duck_res_col_kind(res: Int64, col: Int): Int
+extern "gs_duck_res_is_null" def c_duck_res_is_null(res: Int64, col: Int, row: Int64): Int
+extern "gs_duck_res_get_i64" def c_duck_res_get_i64(res: Int64, col: Int, row: Int64): Int64
+extern "gs_duck_res_get_f64" def c_duck_res_get_f64(res: Int64, col: Int, row: Int64): Float
+extern "gs_duck_res_get_str" def c_duck_res_get_str(res: Int64, col: Int, row: Int64): String
+extern "gs_duck_res_copy_f64" def c_duck_res_copy_f64(res: Int64, col: Int, dst: Ptr, maxRows: Int64): Int64
+extern "gs_duck_res_copy_i64" def c_duck_res_copy_i64(res: Int64, col: Int, dst: Ptr, maxRows: Int64): Int64
+extern "gs_duck_last_error" def c_duck_last_error(): String
+
+pub data Database { Database(Int64) }
+pub data Connection { Connection(Int64) }
+pub data QueryResult { QueryResult(Int64) }
+pub data PreparedStmt { PreparedStmt(Int64) }
+
+pub data ColKind {
+    ColBool,
+    ColInt64,
+    ColFloat,
+    ColString,
+}
+
+def copyCString(s: String): String = {
+    let n = strLen(s);
+    if (n == 0) ""
+    else {
+        let b = bufNew();
+        bufPushStr(b, s);
+        bufToString(b)
+    }
+}
+
+def lastDuckErr(fallback: String): String = {
+    let e = c_duck_last_error();
+    if (strLen(e) > 0) copyCString(e) else fallback
+}
+
+pub def openMemory(): Result Database String = openFile(":memory:")
+
+pub def openFile(path: String): Result Database String = {
+    let h = c_duck_open(path);
+    if (h < intToI64(0)) Err(lastDuckErr("failed to open DuckDB: " + path))
+    else Ok(Database(h))
+}
+
+pub def closeDb(db: Database): Void = match db {
+    Database(h) -> { let _ = c_duck_close(h); () },
+}
+
+pub def connect(db: Database): Result Connection String = match db {
+    Database(h) -> {
+        let ch = c_duck_connect(h);
+        if (ch < intToI64(0)) Err(lastDuckErr("failed to connect to DuckDB"))
+        else Ok(Connection(ch))
+    },
+}
+
+pub def disconnect(conn: Connection): Void = match conn {
+    Connection(h) -> { let _ = c_duck_disconnect(h); () },
+}
+
+pub def query(conn: Connection, sql: String): Result QueryResult String = match conn {
+    Connection(h) -> {
+        let rh = c_duck_query(h, sql);
+        if (rh < intToI64(0)) Err(lastDuckErr("DuckDB query failed"))
+        else Ok(QueryResult(rh))
+    },
+}
+
+pub def exec(conn: Connection, sql: String): Result Void String = {
+    let r = query(conn, sql)?;
+    closeResult(r);
+    Ok(())
+}
+
+pub def prepare(conn: Connection, sql: String): Result PreparedStmt String = match conn {
+    Connection(h) -> {
+        let sh = c_duck_prepare(h, sql);
+        if (sh < intToI64(0)) Err(lastDuckErr("DuckDB prepare failed"))
+        else Ok(PreparedStmt(sh))
+    },
+}
+
+pub def bindInt64(stmt: PreparedStmt, idx: Int, val: Int64): Result Void String = match stmt {
+    PreparedStmt(h) ->
+        if (c_duck_bind_i64(h, idx, val) == 0) Ok(())
+        else Err("DuckDB bindInt64 failed"),
+}
+
+pub def bindFloat(stmt: PreparedStmt, idx: Int, val: Float): Result Void String = match stmt {
+    PreparedStmt(h) ->
+        if (c_duck_bind_f64(h, idx, val) == 0) Ok(())
+        else Err("DuckDB bindFloat failed"),
+}
+
+pub def bindStr(stmt: PreparedStmt, idx: Int, val: String): Result Void String = match stmt {
+    PreparedStmt(h) ->
+        if (c_duck_bind_str(h, idx, val) == 0) Ok(())
+        else Err("DuckDB bindStr failed"),
+}
+
+pub def bindBool(stmt: PreparedStmt, idx: Int, val: Bool): Result Void String = match stmt {
+    PreparedStmt(h) ->
+        if (c_duck_bind_bool(h, idx, if (val) 1 else 0) == 0) Ok(())
+        else Err("DuckDB bindBool failed"),
+}
+
+pub def bindNull(stmt: PreparedStmt, idx: Int): Result Void String = match stmt {
+    PreparedStmt(h) ->
+        if (c_duck_bind_null(h, idx) == 0) Ok(())
+        else Err("DuckDB bindNull failed"),
+}
+
+pub def execPrepared(stmt: PreparedStmt): Result QueryResult String = match stmt {
+    PreparedStmt(h) -> {
+        let rh = c_duck_exec_prepared(h);
+        if (rh < intToI64(0)) Err(lastDuckErr("DuckDB execPrepared failed"))
+        else Ok(QueryResult(rh))
+    },
+}
+
+pub def closeStmt(stmt: PreparedStmt): Void = match stmt {
+    PreparedStmt(h) -> { let _ = c_duck_destroy_prepare(h); () },
+}
+
+pub def closeResult(res: QueryResult): Void = match res {
+    QueryResult(h) -> { let _ = c_duck_res_close(h); () },
+}
+
+pub def resRowCount(res: QueryResult): Int64 = match res {
+    QueryResult(h) -> c_duck_res_row_count(h),
+}
+
+pub def resColCount(res: QueryResult): Int = match res {
+    QueryResult(h) -> c_duck_res_col_count(h),
+}
+
+pub def resColName(res: QueryResult, col: Int): String = match res {
+    QueryResult(h) -> copyCString(c_duck_res_col_name(h, col)),
+}
+
+pub def resColKind(res: QueryResult, col: Int): ColKind = match res {
+    QueryResult(h) -> {
+        let k = c_duck_res_col_kind(h, col);
+        if (k == 1) ColBool
+        else if (k == 2) ColInt64
+        else if (k == 3) ColFloat
+        else ColString
+    },
+}
+
+pub def resIsNull(res: QueryResult, col: Int, row: Int64): Bool = match res {
+    QueryResult(h) -> c_duck_res_is_null(h, col, row) != 0,
+}
+
+pub def resGetBool(res: QueryResult, col: Int, row: Int64): Bool = match res {
+    QueryResult(h) -> c_duck_res_get_i64(h, col, row) != intToI64(0),
+}
+
+pub def resGetInt64(res: QueryResult, col: Int, row: Int64): Int64 = match res {
+    QueryResult(h) -> c_duck_res_get_i64(h, col, row),
+}
+
+pub def resGetFloat(res: QueryResult, col: Int, row: Int64): Float = match res {
+    QueryResult(h) -> c_duck_res_get_f64(h, col, row),
+}
+
+pub def resGetStr(res: QueryResult, col: Int, row: Int64): String = match res {
+    QueryResult(h) -> copyCString(c_duck_res_get_str(h, col, row)),
+}
+
+pub def resColCopyF64Ptr(res: QueryResult, col: Int, dst: Ptr, maxRows: Int64): Int64 = match res {
+    QueryResult(h) -> c_duck_res_copy_f64(h, col, dst, maxRows),
+}
+
+pub def resColCopyI64Ptr(res: QueryResult, col: Int, dst: Ptr, maxRows: Int64): Int64 = match res {
+    QueryResult(h) -> c_duck_res_copy_i64(h, col, dst, maxRows),
+}
+
+pub def resColToFloatArray(res: QueryResult, col: Int): MutArray Float = {
+    let n = i64ToInt(resRowCount(res));
+    let arr = arrayNew(n, 0.0);
+    if (n > 0) {
+        let buf = ptrAllocBytes(n * 8);
+        let copied = i64ToInt(resColCopyF64Ptr(res, col, buf, intToI64(n)));
+        let i = cellNew(0);
+        while (cellGet(i) < copied) {
+            let idx = cellGet(i);
+            arraySet(arr, idx, ptrReadF64Le(buf, idx * 8));
+            cellSet(i, idx + 1)
+        }
+    } else ();
+    arr
+}
+
+pub def resColToInt64Array(res: QueryResult, col: Int): MutArray Int64 = {
+    let n = i64ToInt(resRowCount(res));
+    let arr = arrayNew(n, intToI64(0));
+    if (n > 0) {
+        let buf = ptrAllocBytes(n * 8);
+        let copied = i64ToInt(resColCopyI64Ptr(res, col, buf, intToI64(n)));
+        let i = cellNew(0);
+        while (cellGet(i) < copied) {
+            let idx = cellGet(i);
+            arraySet(arr, idx, ptrReadI64Le(buf, idx * 8));
+            cellSet(i, idx + 1)
+        }
+    } else ();
+    arr
+}
+
+pub def resColToStrArray(res: QueryResult, col: Int): MutArray String = {
+    let n = i64ToInt(resRowCount(res));
+    let arr = arrayNew(n, "");
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        arraySet(arr, idx, resGetStr(res, col, intToI64(idx)));
+        cellSet(i, idx + 1)
+    };
+    arr
+}
+
+pub def queryScalarInt64(conn: Connection, sql: String): Result Int64 String = {
+    let r = query(conn, sql)?;
+    if (resRowCount(r) == intToI64(0) || resColCount(r) == 0) {
+        closeResult(r);
+        Err("queryScalarInt64 returned empty result")
+    } else {
+        let v = resGetInt64(r, 0, intToI64(0));
+        closeResult(r);
+        Ok(v)
+    }
+}
+
+pub def queryScalarFloat(conn: Connection, sql: String): Result Float String = {
+    let r = query(conn, sql)?;
+    if (resRowCount(r) == intToI64(0) || resColCount(r) == 0) {
+        closeResult(r);
+        Err("queryScalarFloat returned empty result")
+    } else {
+        let v = resGetFloat(r, 0, intToI64(0));
+        closeResult(r);
+        Ok(v)
+    }
+}
+
+pub def queryScalarStr(conn: Connection, sql: String): Result String String = {
+    let r = query(conn, sql)?;
+    if (resRowCount(r) == intToI64(0) || resColCount(r) == 0) {
+        closeResult(r);
+        Err("queryScalarStr returned empty result")
+    } else {
+        let v = resGetStr(r, 0, intToI64(0));
+        closeResult(r);
+        Ok(v)
+    }
+}
+
+def sqlQuoteLiteral(s: String): String = {
+    let out = bufNew();
+    bufPushByte(out, 39);
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let b = strByteAt(s, cellGet(i));
+        if (b == 39) {
+            bufPushByte(out, 39);
+            bufPushByte(out, 39)
+        } else {
+            bufPushByte(out, b)
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushByte(out, 39);
+    bufToString(out)
+}
+
+pub def readParquet(conn: Connection, path: String): Result QueryResult String =
+    query(conn, "SELECT * FROM read_parquet(" + sqlQuoteLiteral(path) + ")")
+
+pub def readCsv(conn: Connection, path: String): Result QueryResult String =
+    query(conn, "SELECT * FROM read_csv_auto(" + sqlQuoteLiteral(path) + ")")
+
+pub def writeParquet(conn: Connection, selectSql: String, path: String): Result Void String =
+    exec(conn, "COPY (" + selectSql + ") TO " + sqlQuoteLiteral(path) + " (FORMAT PARQUET, COMPRESSION ZSTD)")

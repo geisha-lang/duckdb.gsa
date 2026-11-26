@@ -1,0 +1,531 @@
+// Composable, SQL-injection-safe Query DSL (`duckdb.dsl`) for DuckDB.
+// Supports pipeline composition with `|>`:
+//
+//   fromParquet("klines.parquet")
+//     |> filter(and_(gt(col("close"), litFloat(100.0)), isNotNull(col("close"))))
+//     |> select([col("sym"), asCol(avg(col("close")), "avg_close"), asCol(countAll(), "n")])
+//     |> groupBy(["sym"])
+//     |> orderByDesc("avg_close")
+//     |> limit(20)
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
+use std.str.{intToStr, i64ToStr, floatToStr}
+use std.list.listAppend
+use duckdb.duckdb.{Connection, QueryResult, query, writeParquet}
+
+pub def (|>)(x: a, f: a -> b): b = f(x)
+
+// ---- Expressions ----
+
+pub data Expr {
+    ECol(String),
+    EQualCol(String, String),
+    ELitInt(Int64),
+    ELitFloat(Float),
+    ELitStr(String),
+    ELitBool(Bool),
+    ELitNull,
+    EBin(String, Expr, Expr),
+    EUnary(String, Expr),
+    EPostfix(Expr, String),
+    EFn(String, List Expr),
+    ECountAll,
+    ECountDistinct(Expr),
+    EAlias(Expr, String),
+    ECast(Expr, String),
+    EBetween(Expr, Expr, Expr),
+    EIn(Expr, List Expr),
+    EOver(Expr, List String, List OrderItem),
+    ERaw(String),
+}
+
+pub data OrderDir {
+    Asc,
+    Desc,
+}
+
+pub data OrderItem {
+    OrderItem(Expr, OrderDir),
+}
+
+pub data JoinKind {
+    InnerJoin,
+    LeftJoin,
+    RightJoin,
+    FullJoin,
+}
+
+pub data Source {
+    SrcTable(String),
+    SrcParquet(String),
+    SrcCsv(String),
+    SrcSubquery(Query, String),
+}
+
+pub data JoinClause {
+    JoinClause {
+        kind: JoinKind,
+        source: Source,
+        alias: Option String,
+        onExpr: Expr,
+    },
+}
+
+pub data Query {
+    MkQuery {
+        source: Source,
+        sourceAlias: Option String,
+        joins: List JoinClause,
+        projections: List Expr,
+        isDistinct: Bool,
+        whereExpr: Option Expr,
+        groupCols: List String,
+        havingExpr: Option Expr,
+        orderItems: List OrderItem,
+        limitOpt: Option Int,
+        offsetOpt: Option Int,
+    },
+}
+
+// ---- Escaping helpers ----
+
+def quoteIdent(name: String): String = {
+    let out = bufNew();
+    bufPushByte(out, 34);
+    let n = strLen(name);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let b = strByteAt(name, cellGet(i));
+        if (b == 34) {
+            bufPushByte(out, 34);
+            bufPushByte(out, 34)
+        } else {
+            bufPushByte(out, b)
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushByte(out, 34);
+    bufToString(out)
+}
+
+def quoteStr(s: String): String = {
+    let out = bufNew();
+    bufPushByte(out, 39);
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let b = strByteAt(s, cellGet(i));
+        if (b == 39) {
+            bufPushByte(out, 39);
+            bufPushByte(out, 39)
+        } else {
+            bufPushByte(out, b)
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushByte(out, 39);
+    bufToString(out)
+}
+
+// ---- Expression constructors ----
+
+pub def col(name: String): Expr = ECol(name)
+pub def qcol(table: String, name: String): Expr = EQualCol(table, name)
+pub def litInt(n: Int): Expr = ELitInt(intToI64(n))
+pub def litInt64(n: Int64): Expr = ELitInt(n)
+pub def litFloat(x: Float): Expr = ELitFloat(x)
+pub def litStr(s: String): Expr = ELitStr(s)
+pub def litBool(b: Bool): Expr = ELitBool(b)
+pub def litNull(): Expr = ELitNull
+pub def rawExpr(sql: String): Expr = ERaw(sql)
+
+pub def eq(a: Expr, b: Expr): Expr = EBin("=", a, b)
+pub def neq(a: Expr, b: Expr): Expr = EBin("<>", a, b)
+pub def lt(a: Expr, b: Expr): Expr = EBin("<", a, b)
+pub def lte(a: Expr, b: Expr): Expr = EBin("<=", a, b)
+pub def gt(a: Expr, b: Expr): Expr = EBin(">", a, b)
+pub def gte(a: Expr, b: Expr): Expr = EBin(">=", a, b)
+
+pub def and_(a: Expr, b: Expr): Expr = EBin("AND", a, b)
+pub def or_(a: Expr, b: Expr): Expr = EBin("OR", a, b)
+pub def not_(a: Expr): Expr = EUnary("NOT", a)
+pub def isNull(a: Expr): Expr = EPostfix(a, "IS NULL")
+pub def isNotNull(a: Expr): Expr = EPostfix(a, "IS NOT NULL")
+pub def like(a: Expr, pattern: String): Expr = EBin("LIKE", a, ELitStr(pattern))
+pub def between(x: Expr, lo: Expr, hi: Expr): Expr = EBetween(x, lo, hi)
+
+def mapStrLits(xs: List String): List Expr = match xs {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(ELitStr(h), mapStrLits(t)),
+}
+
+def mapIntLits(xs: List Int64): List Expr = match xs {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(ELitInt(h), mapIntLits(t)),
+}
+
+pub def inStrs(x: Expr, vals: List String): Expr = EIn(x, mapStrLits(vals))
+pub def inInt64s(x: Expr, vals: List Int64): Expr = EIn(x, mapIntLits(vals))
+
+pub def add(a: Expr, b: Expr): Expr = EBin("+", a, b)
+pub def sub(a: Expr, b: Expr): Expr = EBin("-", a, b)
+pub def mul(a: Expr, b: Expr): Expr = EBin("*", a, b)
+pub def div(a: Expr, b: Expr): Expr = EBin("/", a, b)
+pub def neg(a: Expr): Expr = EUnary("-", a)
+
+pub def asCol(e: Expr, alias: String): Expr = EAlias(e, alias)
+pub def fnCall(name: String, args: List Expr): Expr = EFn(name, args)
+pub def sum(e: Expr): Expr = EFn("SUM", [e])
+pub def avg(e: Expr): Expr = EFn("AVG", [e])
+pub def min_(e: Expr): Expr = EFn("MIN", [e])
+pub def max_(e: Expr): Expr = EFn("MAX", [e])
+pub def stddev(e: Expr): Expr = EFn("STDDEV_SAMP", [e])
+pub def median(e: Expr): Expr = EFn("MEDIAN", [e])
+pub def countAll(): Expr = ECountAll
+pub def countCol(e: Expr): Expr = EFn("COUNT", [e])
+pub def countDistinct(e: Expr): Expr = ECountDistinct(e)
+pub def coalesce(a: Expr, b: Expr): Expr = EFn("COALESCE", [a, b])
+pub def castFloat(e: Expr): Expr = ECast(e, "DOUBLE")
+pub def castInt64(e: Expr): Expr = ECast(e, "BIGINT")
+pub def castStr(e: Expr): Expr = ECast(e, "VARCHAR")
+
+pub def overPartition(e: Expr, partitionCols: List String, orders: List OrderItem): Expr =
+    EOver(e, partitionCols, orders)
+
+pub def asc(e: Expr): OrderItem = OrderItem(e, Asc)
+pub def desc(e: Expr): OrderItem = OrderItem(e, Desc)
+
+// ---- Query constructors & pipeline combinators ----
+
+def emptyQuery(src: Source): Query =
+    MkQuery {
+        source: src,
+        sourceAlias: None,
+        joins: Nil,
+        projections: Nil,
+        isDistinct: false,
+        whereExpr: None,
+        groupCols: Nil,
+        havingExpr: None,
+        orderItems: Nil,
+        limitOpt: None,
+        offsetOpt: None,
+    }
+
+pub def fromTable(name: String): Query = emptyQuery(SrcTable(name))
+pub def fromParquet(path: String): Query = emptyQuery(SrcParquet(path))
+pub def fromCsv(path: String): Query = emptyQuery(SrcCsv(path))
+pub def fromSubquery(sub: Query, alias: String): Query = emptyQuery(SrcSubquery(sub, alias))
+
+pub def asTable(alias: String): Query -> Query = (q: Query) ->
+    MkQuery {
+        source: q.source,
+        sourceAlias: Some(alias),
+        joins: q.joins,
+        projections: q.projections,
+        isDistinct: q.isDistinct,
+        whereExpr: q.whereExpr,
+        groupCols: q.groupCols,
+        havingExpr: q.havingExpr,
+        orderItems: q.orderItems,
+        limitOpt: q.limitOpt,
+        offsetOpt: q.offsetOpt,
+    }
+
+pub def select(exprs: List Expr): Query -> Query = (q: Query) ->
+    MkQuery {
+        source: q.source,
+        sourceAlias: q.sourceAlias,
+        joins: q.joins,
+        projections: exprs,
+        isDistinct: q.isDistinct,
+        whereExpr: q.whereExpr,
+        groupCols: q.groupCols,
+        havingExpr: q.havingExpr,
+        orderItems: q.orderItems,
+        limitOpt: q.limitOpt,
+        offsetOpt: q.offsetOpt,
+    }
+
+def mapColNames(names: List String): List Expr = match names {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(ECol(h), mapColNames(t)),
+}
+
+pub def selectCols(names: List String): Query -> Query = (q: Query) ->
+    select(mapColNames(names))(q)
+
+pub def distinct(): Query -> Query = (q: Query) ->
+    MkQuery {
+        source: q.source,
+        sourceAlias: q.sourceAlias,
+        joins: q.joins,
+        projections: q.projections,
+        isDistinct: true,
+        whereExpr: q.whereExpr,
+        groupCols: q.groupCols,
+        havingExpr: q.havingExpr,
+        orderItems: q.orderItems,
+        limitOpt: q.limitOpt,
+        offsetOpt: q.offsetOpt,
+    }
+
+// Multiple `filter` calls combine with AND.
+pub def filter(pred: Expr): Query -> Query = (q: Query) -> {
+    let nextWhere = match q.whereExpr {
+        None -> Some(pred),
+        Some(prev) -> Some(and_(prev, pred)),
+    };
+    MkQuery {
+        source: q.source,
+        sourceAlias: q.sourceAlias,
+        joins: q.joins,
+        projections: q.projections,
+        isDistinct: q.isDistinct,
+        whereExpr: nextWhere,
+        groupCols: q.groupCols,
+        havingExpr: q.havingExpr,
+        orderItems: q.orderItems,
+        limitOpt: q.limitOpt,
+        offsetOpt: q.offsetOpt,
+    }
+}
+
+pub def groupBy(cols: List String): Query -> Query = (q: Query) ->
+    MkQuery {
+        source: q.source,
+        sourceAlias: q.sourceAlias,
+        joins: q.joins,
+        projections: q.projections,
+        isDistinct: q.isDistinct,
+        whereExpr: q.whereExpr,
+        groupCols: listAppend(q.groupCols, cols),
+        havingExpr: q.havingExpr,
+        orderItems: q.orderItems,
+        limitOpt: q.limitOpt,
+        offsetOpt: q.offsetOpt,
+    }
+
+pub def having(pred: Expr): Query -> Query = (q: Query) -> {
+    let nextHaving = match q.havingExpr {
+        None -> Some(pred),
+        Some(prev) -> Some(and_(prev, pred)),
+    };
+    MkQuery {
+        source: q.source,
+        sourceAlias: q.sourceAlias,
+        joins: q.joins,
+        projections: q.projections,
+        isDistinct: q.isDistinct,
+        whereExpr: q.whereExpr,
+        groupCols: q.groupCols,
+        havingExpr: nextHaving,
+        orderItems: q.orderItems,
+        limitOpt: q.limitOpt,
+        offsetOpt: q.offsetOpt,
+    }
+}
+
+pub def orderBy(items: List OrderItem): Query -> Query = (q: Query) ->
+    MkQuery {
+        source: q.source,
+        sourceAlias: q.sourceAlias,
+        joins: q.joins,
+        projections: q.projections,
+        isDistinct: q.isDistinct,
+        whereExpr: q.whereExpr,
+        groupCols: q.groupCols,
+        havingExpr: q.havingExpr,
+        orderItems: listAppend(q.orderItems, items),
+        limitOpt: q.limitOpt,
+        offsetOpt: q.offsetOpt,
+    }
+
+pub def orderByAsc(colName: String): Query -> Query = orderBy([OrderItem(ECol(colName), Asc)])
+pub def orderByDesc(colName: String): Query -> Query = orderBy([OrderItem(ECol(colName), Desc)])
+
+pub def limit(n: Int): Query -> Query = (q: Query) ->
+    MkQuery {
+        source: q.source,
+        sourceAlias: q.sourceAlias,
+        joins: q.joins,
+        projections: q.projections,
+        isDistinct: q.isDistinct,
+        whereExpr: q.whereExpr,
+        groupCols: q.groupCols,
+        havingExpr: q.havingExpr,
+        orderItems: q.orderItems,
+        limitOpt: Some(n),
+        offsetOpt: q.offsetOpt,
+    }
+
+pub def offset(n: Int): Query -> Query = (q: Query) ->
+    MkQuery {
+        source: q.source,
+        sourceAlias: q.sourceAlias,
+        joins: q.joins,
+        projections: q.projections,
+        isDistinct: q.isDistinct,
+        whereExpr: q.whereExpr,
+        groupCols: q.groupCols,
+        havingExpr: q.havingExpr,
+        orderItems: q.orderItems,
+        limitOpt: q.limitOpt,
+        offsetOpt: Some(n),
+    }
+
+def addJoin(kind: JoinKind, src: Source, alias: Option String, onExpr: Expr): Query -> Query = (q: Query) ->
+    MkQuery {
+        source: q.source,
+        sourceAlias: q.sourceAlias,
+        joins: listAppend(q.joins, [JoinClause { kind: kind, source: src, alias: alias, onExpr: onExpr }]),
+        projections: q.projections,
+        isDistinct: q.isDistinct,
+        whereExpr: q.whereExpr,
+        groupCols: q.groupCols,
+        havingExpr: q.havingExpr,
+        orderItems: q.orderItems,
+        limitOpt: q.limitOpt,
+        offsetOpt: q.offsetOpt,
+    }
+
+pub def joinInner(table: String, onExpr: Expr): Query -> Query =
+    addJoin(InnerJoin, SrcTable(table), None, onExpr)
+
+pub def joinLeft(table: String, onExpr: Expr): Query -> Query =
+    addJoin(LeftJoin, SrcTable(table), None, onExpr)
+
+pub def joinParquetLeft(path: String, alias: String, onExpr: Expr): Query -> Query =
+    addJoin(LeftJoin, SrcParquet(path), Some(alias), onExpr)
+
+// ---- SQL Rendering ----
+
+def renderExprList(xs: List Expr, sep: String): String = match xs {
+    Nil -> "",
+    Cons(h, Nil) -> renderExpr(h),
+    Cons(h, t) -> renderExpr(h) + sep + renderExprList(t, sep),
+}
+
+def renderIdentList(xs: List String, sep: String): String = match xs {
+    Nil -> "",
+    Cons(h, Nil) -> quoteIdent(h),
+    Cons(h, t) -> quoteIdent(h) + sep + renderIdentList(t, sep),
+}
+
+def renderOrderItem(item: OrderItem): String = match item {
+    OrderItem(e, Asc) -> renderExpr(e) + " ASC",
+    OrderItem(e, Desc) -> renderExpr(e) + " DESC",
+}
+
+def renderOrderList(xs: List OrderItem): String = match xs {
+    Nil -> "",
+    Cons(h, Nil) -> renderOrderItem(h),
+    Cons(h, t) -> renderOrderItem(h) + ", " + renderOrderList(t),
+}
+
+pub def renderExpr(e: Expr): String = match e {
+    ECol(name) -> quoteIdent(name),
+    EQualCol(tbl, name) -> quoteIdent(tbl) + "." + quoteIdent(name),
+    ELitInt(n) -> i64ToStr(n),
+    ELitFloat(x) -> floatToStr(x),
+    ELitStr(s) -> quoteStr(s),
+    ELitBool(b) -> if (b) "TRUE" else "FALSE",
+    ELitNull -> "NULL",
+    EBin(op, a, b) -> "(" + renderExpr(a) + " " + op + " " + renderExpr(b) + ")",
+    EUnary(op, a) -> "(" + op + " " + renderExpr(a) + ")",
+    EPostfix(a, suf) -> "(" + renderExpr(a) + " " + suf + ")",
+    EFn(name, args) -> name + "(" + renderExprList(args, ", ") + ")",
+    ECountAll -> "COUNT(*)",
+    ECountDistinct(x) -> "COUNT(DISTINCT " + renderExpr(x) + ")",
+    EAlias(inner, alias) -> renderExpr(inner) + " AS " + quoteIdent(alias),
+    ECast(inner, ty) -> "CAST(" + renderExpr(inner) + " AS " + ty + ")",
+    EBetween(x, lo, hi) -> "(" + renderExpr(x) + " BETWEEN " + renderExpr(lo) + " AND " + renderExpr(hi) + ")",
+    EIn(x, vals) -> "(" + renderExpr(x) + " IN (" + renderExprList(vals, ", ") + "))",
+    EOver(inner, parts, orders) -> {
+        let pSql = match parts {
+            Nil -> "",
+            _ -> "PARTITION BY " + renderIdentList(parts, ", "),
+        };
+        let oSql = match orders {
+            Nil -> "",
+            _ -> (if (strLen(pSql) > 0) " " else "") + "ORDER BY " + renderOrderList(orders),
+        };
+        renderExpr(inner) + " OVER (" + pSql + oSql + ")"
+    },
+    ERaw(s) -> s,
+}
+
+def renderSource(src: Source): String = match src {
+    SrcTable(name) -> quoteIdent(name),
+    SrcParquet(path) -> "read_parquet(" + quoteStr(path) + ")",
+    SrcCsv(path) -> "read_csv_auto(" + quoteStr(path) + ")",
+    SrcSubquery(sub, alias) -> "(" + toSql(sub) + ") AS " + quoteIdent(alias),
+}
+
+def renderJoinKind(k: JoinKind): String = match k {
+    InnerJoin -> " INNER JOIN ",
+    LeftJoin -> " LEFT JOIN ",
+    RightJoin -> " RIGHT JOIN ",
+    FullJoin -> " FULL JOIN ",
+}
+
+def renderJoins(js: List JoinClause): String = match js {
+    Nil -> "",
+    Cons(j, rest) -> {
+        let aliasSql = match j.alias {
+            Some(a) -> " AS " + quoteIdent(a),
+            None -> "",
+        };
+        renderJoinKind(j.kind) + renderSource(j.source) + aliasSql + " ON " + renderExpr(j.onExpr) + renderJoins(rest)
+    },
+}
+
+pub def toSql(q: Query): String = {
+    let out = bufNew();
+    bufPushStr(out, "SELECT ");
+    if (q.isDistinct) bufPushStr(out, "DISTINCT ") else ();
+    match q.projections {
+        Nil -> bufPushStr(out, "*"),
+        _ -> bufPushStr(out, renderExprList(q.projections, ", ")),
+    };
+    bufPushStr(out, " FROM ");
+    bufPushStr(out, renderSource(q.source));
+    match q.sourceAlias {
+        Some(a) -> { bufPushStr(out, " AS "); bufPushStr(out, quoteIdent(a)) },
+        None -> (),
+    };
+    bufPushStr(out, renderJoins(q.joins));
+    match q.whereExpr {
+        Some(w) -> { bufPushStr(out, " WHERE "); bufPushStr(out, renderExpr(w)) },
+        None -> (),
+    };
+    match q.groupCols {
+        Nil -> (),
+        _ -> { bufPushStr(out, " GROUP BY "); bufPushStr(out, renderIdentList(q.groupCols, ", ")) },
+    };
+    match q.havingExpr {
+        Some(h) -> { bufPushStr(out, " HAVING "); bufPushStr(out, renderExpr(h)) },
+        None -> (),
+    };
+    match q.orderItems {
+        Nil -> (),
+        _ -> { bufPushStr(out, " ORDER BY "); bufPushStr(out, renderOrderList(q.orderItems)) },
+    };
+    match q.limitOpt {
+        Some(lim) -> { bufPushStr(out, " LIMIT "); bufPushStr(out, intToStr(lim)) },
+        None -> (),
+    };
+    match q.offsetOpt {
+        Some(off) -> { bufPushStr(out, " OFFSET "); bufPushStr(out, intToStr(off)) },
+        None -> (),
+    };
+    bufToString(out)
+}
+
+pub def runQuery(conn: Connection, q: Query): Result QueryResult String =
+    query(conn, toSql(q))
+
+pub def writeQueryParquet(conn: Connection, q: Query, path: String): Result Void String =
+    writeParquet(conn, toSql(q), path)
