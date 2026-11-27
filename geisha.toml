@@ -5,5 +5,13 @@ tests = ["tests/spec.gsa"]
 
 [target.native]
 c_sources = ["native/gs_duckdb.c"]
-c_flags = ["-I/opt/homebrew/opt/duckdb/include"]
-link_flags = ["-L/opt/homebrew/opt/duckdb/lib", "-Wl,-rpath,/opt/homebrew/opt/duckdb/lib", "-lduckdb"]
+
+[[target.native.when]]
+os = "macos"
+c_flags = ["-I/opt/homebrew/opt/duckdb/include", "-I/usr/local/opt/duckdb/include"]
+link_flags = ["-L/opt/homebrew/opt/duckdb/lib", "-Wl,-rpath,/opt/homebrew/opt/duckdb/lib", "-L/usr/local/opt/duckdb/lib", "-lduckdb"]
+
+[[target.native.when]]
+os = "linux"
+c_flags = ["-I/usr/local/include"]
+link_flags = ["-L/usr/local/lib", "-Wl,-rpath,/usr/local/lib", "-lduckdb"]
